@@ -1,6 +1,12 @@
 package tachiyomi.source.local
 
+import android.content.ContentResolver
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.pdf.PdfRenderer
+import android.os.ParcelFileDescriptor
 import com.hippo.unifile.UniFile
 import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.source.Source
@@ -41,8 +47,12 @@ import tachiyomi.source.local.io.Format
 import tachiyomi.source.local.io.LocalSourceFileSystem
 import tachiyomi.source.local.metadata.fillMetadata
 import uy.kohesive.injekt.injectLazy
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
+import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.days
 import tachiyomi.domain.source.model.Source as DomainSource
 
@@ -259,7 +269,12 @@ actual class LocalSource(
         val chapters = fileSystem.getFilesInMangaDirectory(manga.url)
             // Only keep supported formats
             .filterNot { it.name.orEmpty().startsWith('.') }
-            .filter { it.isDirectory || Archive.isSupported(it) || it.extension.equals("epub", true) }
+            .filter {
+                it.isDirectory ||
+                    Archive.isSupported(it) ||
+                    it.extension.equals("epub", true) ||
+                    it.extension.equals("pdf", true)
+            }
             .map { chapterFile ->
                 SChapter.create().apply {
                     url = "${manga.url}/${chapterFile.name}"
@@ -274,14 +289,19 @@ actual class LocalSource(
                         .toFloat()
 
                     val format = Format.valueOf(chapterFile)
-                    if (format is Format.Epub) {
-                        format.file.epubReader(context).use { epub ->
-                            epub.fillMetadata(manga, this)
+                    when (format) {
+                        is Format.Epub -> {
+                            format.file.epubReader(context).use { epub ->
+                                epub.fillMetadata(manga, this)
+                            }
                         }
-                    } else {
-                        getComicInfoForChapter(chapterFile) { stream ->
-                            setChapterDetailsFromComicInfoFile(stream, this)
+                        is Format.Directory,
+                        is Format.Archive -> {
+                            getComicInfoForChapter(chapterFile) { stream ->
+                                setChapterDetailsFromComicInfoFile(stream, this)
+                            }
                         }
+                        is Format.Pdf -> Unit
                     }
                 }
             }
@@ -354,6 +374,11 @@ actual class LocalSource(
                         entry?.let { coverManager.update(manga, epub.getInputStream(it)!!) }
                     }
                 }
+                is Format.Pdf -> {
+                    renderPdfPage(format.file, pageIndex = 0, targetWidth = 768)
+                        ?.inputStream()
+                        ?.let { coverManager.update(manga, it) }
+                }
             }
         } catch (e: Throwable) {
             logcat(LogPriority.ERROR, e) { "Error updating cover for ${manga.title}" }
@@ -366,6 +391,63 @@ actual class LocalSource(
         const val HELP_URL = "https://mihon.app/docs/guides/local-source/"
 
         private val LATEST_THRESHOLD = 7.days.inWholeMilliseconds
+        private const val MAX_PDF_RENDER_DIMENSION = 4096
+    }
+
+    private fun renderPdfPage(
+        file: UniFile,
+        pageIndex: Int,
+        targetWidth: Int,
+    ): ByteArray? {
+        val fileDescriptor = openPdfFileDescriptor(file)
+        return fileDescriptor.use { descriptor ->
+            PdfRenderer(descriptor).use { renderer ->
+                if (pageIndex !in 0 until renderer.pageCount) return null
+
+                renderer.openPage(pageIndex).use { page ->
+                    var scale = (targetWidth.toFloat() / page.width.toFloat())
+                        .takeIf { it.isFinite() && it > 0f }
+                        ?: 1f
+                    var width = (page.width * scale).roundToInt().coerceAtLeast(1)
+                    var height = (page.height * scale).roundToInt().coerceAtLeast(1)
+                    val dimensionScale = (MAX_PDF_RENDER_DIMENSION.toFloat() / max(width, height).toFloat())
+                        .coerceAtMost(1f)
+                    if (dimensionScale < 1f) {
+                        scale *= dimensionScale
+                        width = (page.width * scale).roundToInt().coerceAtLeast(1)
+                        height = (page.height * scale).roundToInt().coerceAtLeast(1)
+                    }
+                    val matrix = Matrix().apply { setScale(scale, scale) }
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+
+                    try {
+                        bitmap.eraseColor(Color.WHITE)
+                        page.render(bitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                        ByteArrayOutputStream().use { output ->
+                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+                            output.toByteArray()
+                        }
+                    } finally {
+                        bitmap.recycle()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun openPdfFileDescriptor(file: UniFile): ParcelFileDescriptor {
+        val uri = file.uri
+        return when (uri.scheme) {
+            ContentResolver.SCHEME_FILE -> {
+                val path = requireNotNull(uri.path) { "PDF file path is missing" }
+                ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+            }
+            else -> {
+                context.contentResolver.openFileDescriptor(uri, "r")
+                    ?: error("Unable to open PDF file descriptor")
+            }
+        }
     }
 }
 
